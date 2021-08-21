@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,11 +17,10 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"golang.org/x/net/context" // "context"
-
+	"golang.org/x/build/gerrit"
 	"golang.org/x/oauth2"
 
-	"github.com/google/go-github/v28/github"
+	"github.com/google/go-github/v38/github"
 	"github.com/mattn/go-shellwords"
 	"github.com/reviewdog/errorformat/fmts"
 	"github.com/xanzy/go-gitlab"
@@ -27,8 +28,13 @@ import (
 	"github.com/reviewdog/reviewdog"
 	"github.com/reviewdog/reviewdog/cienv"
 	"github.com/reviewdog/reviewdog/commands"
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/parser"
 	"github.com/reviewdog/reviewdog/project"
+	bbservice "github.com/reviewdog/reviewdog/service/bitbucket"
+	gerritservice "github.com/reviewdog/reviewdog/service/gerrit"
 	githubservice "github.com/reviewdog/reviewdog/service/github"
+	"github.com/reviewdog/reviewdog/service/github/githubutils"
 	gitlabservice "github.com/reviewdog/reviewdog/service/gitlab"
 )
 
@@ -43,43 +49,58 @@ type option struct {
 	diffCmd          string
 	diffStrip        int
 	efms             strslice
-	f                string // errorformat name
+	f                string // format name
+	fDiffStrip       int
 	list             bool   // list supported errorformat name
 	name             string // tool name which is used in comment
-	ci               string
 	conf             string
 	runners          string
 	reporter         string
 	level            string
 	guessPullRequest bool
+	tee              bool
+	filterMode       filter.Mode
+	failOnError      bool
 }
 
-// flags doc
 const (
-	diffCmdDoc          = `diff command (e.g. "git diff"). diff flag is ignored if you pass "ci" flag`
-	diffStripDoc        = "strip NUM leading components from diff file names (equivalent to 'patch -p') (default is 1 for git diff)"
-	efmsDoc             = `list of errorformat (https://github.com/reviewdog/errorformat)`
-	fDoc                = `format name (run -list to see supported format name) for input. It's also used as tool name in review comment if -name is empty`
-	listDoc             = `list supported pre-defined format names which can be used as -f arg`
-	nameDoc             = `tool name in review comment. -f is used as tool name if -name is empty`
-	ciDoc               = `[deprecated] reviewdog automatically get necessary data. See also -reporter for migration`
+	diffCmdDoc    = `diff command (e.g. "git diff") for local reporter. Do not use --relative flag for git command.`
+	diffStripDoc  = "strip NUM leading components from diff file names (equivalent to 'patch -p') (default is 1 for git diff)"
+	efmsDoc       = `list of supported machine-readable format and errorformat (https://github.com/reviewdog/errorformat)`
+	fDoc          = `format name (run -list to see supported format name) for input. It's also used as tool name in review comment if -name is empty`
+	fDiffStripDoc = `option for -f=diff: strip NUM leading components from diff file names (equivalent to 'patch -p') (default is 1 for git diff)`
+	listDoc       = `list supported pre-defined format names which can be used as -f arg`
+	nameDoc       = `tool name in review comment. -f is used as tool name if -name is empty`
+
 	confDoc             = `config file path`
 	runnersDoc          = `comma separated runners name to run in config file. default: run all runners`
 	levelDoc            = `report level currently used for github-pr-check reporter ("info","warning","error").`
 	guessPullRequestDoc = `guess Pull Request ID by branch name and commit SHA`
-	reporterDoc         = `reporter of reviewdog results. (local, github-check, github-pr-check, github-pr-review, gitlab-mr-discussion, gitlab-mr-commit)
+	teeDoc              = `enable "tee"-like mode which outputs tools's output as is while reporting results to -reporter. Useful for debugging as well.`
+	filterModeDoc       = `how to filter checks results. [added, diff_context, file, nofilter].
+		"added" (default)
+			Filter by added/modified diff lines.
+		"diff_context"
+			Filter by diff context, which can include unchanged lines.
+			i.e. changed lines +-N lines (e.g. N=3 for default git diff).
+		"file"
+			Filter by added/modified file.
+		"nofilter"
+			Do not filter any results.
+`
+	reporterDoc = `reporter of reviewdog results. (local, github-check, github-pr-check, github-pr-review, gitlab-mr-discussion, gitlab-mr-commit)
 	"local" (default)
 		Report results to stdout.
 
-	"github-check" (experimental)
-		Report results to GitHub Check. It works both for Pull Requests and commits
-		and this reporter reports all results regardless of it's new result or not.
-		You can see report results in GitHub PullRequest Check tab for Pull Request.
+	"github-check"
+		Report results to GitHub Check. It works both for Pull Requests and commits.
+		For Pull Request, you can see report results in GitHub PullRequest Check
+		tab and can control filtering mode by -filter-mode flag.
 
 		There are two options to use this reporter.
 
 		Option 1) Run reviewdog from GitHub Actions w/ secrets.GITHUB_TOKEN
-			Note that it reports result to GitHub Actions log consle for Pull
+			Note that it reports result to GitHub Actions log console for Pull
 			Requests from fork repository due to GitHub Actions restriction.
 			https://help.github.com/en/articles/virtual-environments-for-github-actions#github_token-secret
 
@@ -94,9 +115,8 @@ const (
 
 			Note: Token is not required if you run reviewdog in Travis CI.
 
-	"github-pr-check" (experimental)
-		Same as github-check reporter but it only supports Pull Requests and
-		reports only new results which is in diff.
+	"github-pr-check"
+		Same as github-check reporter but it only supports Pull Requests.
 
 	"github-pr-review"
 		Report results to GitHub review comments.
@@ -113,19 +133,47 @@ const (
 		1. Set REVIEWDOG_GITLAB_API_TOKEN environment variable.
 		Go to https://gitlab.com/profile/personal_access_tokens
 
-		For self hosted GitLab:
+		CI_API_V4_URL (defined by Gitlab CI) as the base URL for the Gitlab API automatically.
+		Alternatively, GITLAB_API can also be defined, and it will take precedence over the former:
 			$ export GITLAB_API="https://example.gitlab.com/api/v4"
 
 	"gitlab-mr-commit"
 		Same as gitlab-mr-discussion, but report results to GitLab comments for
 		each commits in Merge Requests.
 
+	"gerrit-change-review"
+		Report results to Gerrit Change comments.
+
+		1. Set GERRIT_USERNAME and GERRIT_PASSWORD for basic authentication or
+		GIT_GITCOOKIE_PATH for git cookie based authentication.
+		2. Set GERRIT_CHANGE_ID, GERRIT_REVISION_ID GERRIT_BRANCH abd GERRIT_ADDRESS
+
+		For example:
+			$ export GERRIT_CHANGE_ID=myproject~master~I1293efab014de2
+			$ export GERRIT_REVISION_ID=ed318bf9a3c
+			$ export GERRIT_BRANCH=master
+			$ export GERRIT_ADDRESS=http://localhost:8080
+	
+	"bitbucket-code-report"
+		Create Bitbucket Code Report via Code Insights
+		(https://confluence.atlassian.com/display/BITBUCKET/Code+insights).
+		You can set custom report name with:
+
+		If running as part of Bitbucket Pipelines no additional configurations is needed.
+		If running outside of Bitbucket Pipelines you need to provide git repo data
+		(see documentation below for local reporters) and BitBucket credentials:
+		- For Basic Auth you need to set following env variables:
+			  BITBUCKET_USER and BITBUCKET_PASSWORD
+		- For AccessToken Auth you need to set BITBUCKET_ACCESS_TOKEN
+		
+		To post results to Bitbucket Server specify BITBUCKET_SERVER_URL.
+
 	For GitHub Enterprise and self hosted GitLab, set
 	REVIEWDOG_INSECURE_SKIP_VERIFY to skip verifying SSL (please use this at your own risk)
 		$ export REVIEWDOG_INSECURE_SKIP_VERIFY=true
 
 	For non-local reporters, reviewdog automatically get necessary data from
-	environment variable in CI service (GitHub Actions, Travis CI, Circle CI, drone.io, GitLab CI).
+	environment variable in CI service (GitHub Actions, Travis CI, Circle CI, drone.io, GitLab CI, Bitbucket Pipelines).
 	You can set necessary data with following environment variable manually if
 	you want (e.g. run reviewdog in Jenkins).
 
@@ -134,6 +182,7 @@ const (
 		$ export CI_REPO_OWNER="haya14busa" # repository owner
 		$ export CI_REPO_NAME="reviewdog" # repository name
 `
+	failOnErrorDoc = `Returns 1 as exit code if any errors/warnings found in input`
 )
 
 var opt = &option{}
@@ -144,14 +193,17 @@ func init() {
 	flag.IntVar(&opt.diffStrip, "strip", 1, diffStripDoc)
 	flag.Var(&opt.efms, "efm", efmsDoc)
 	flag.StringVar(&opt.f, "f", "", fDoc)
+	flag.IntVar(&opt.fDiffStrip, "f.diff.strip", 1, fDiffStripDoc)
 	flag.BoolVar(&opt.list, "list", false, listDoc)
 	flag.StringVar(&opt.name, "name", "", nameDoc)
-	flag.StringVar(&opt.ci, "ci", "", ciDoc)
 	flag.StringVar(&opt.conf, "conf", "", confDoc)
 	flag.StringVar(&opt.runners, "runners", "", runnersDoc)
 	flag.StringVar(&opt.reporter, "reporter", "local", reporterDoc)
 	flag.StringVar(&opt.level, "level", "error", levelDoc)
 	flag.BoolVar(&opt.guessPullRequest, "guess", false, guessPullRequestDoc)
+	flag.BoolVar(&opt.tee, "tee", false, teeDoc)
+	flag.Var(&opt.filterMode, "filter-mode", filterModeDoc)
+	flag.BoolVar(&opt.failOnError, "fail-on-error", false, failOnErrorDoc)
 }
 
 func usage() {
@@ -184,19 +236,24 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 		return runList(w)
 	}
 
-	// TODO(haya14busa): clean up when removing -ci flag from next release.
-	if opt.ci != "" {
-		return errors.New(`-ci flag is deprecated.
-See -reporter flag for migration and set -reporter="github-pr-review" or -reporter="github-pr-check" or -reporter="gitlab-mr-commit"`)
+	if opt.tee {
+		r = io.TeeReader(r, w)
 	}
 
 	// assume it's project based run when both -efm and -f are not specified
 	isProject := len(opt.efms) == 0 && opt.f == ""
+	var projectConf *project.Config
 
 	var cs reviewdog.CommentService
 	var ds reviewdog.DiffService
 
 	if isProject {
+		var err error
+		projectConf, err = projectConfig(opt.conf)
+		if err != nil {
+			return err
+		}
+
 		cs = reviewdog.NewUnifiedCommentWriter(w)
 	} else {
 		cs = reviewdog.NewRawCommentWriter(w)
@@ -206,14 +263,10 @@ See -reporter flag for migration and set -reporter="github-pr-review" or -report
 	default:
 		return fmt.Errorf("unknown -reporter: %s", opt.reporter)
 	case "github-check":
-		return runDoghouse(ctx, r, w, opt, isProject, true)
-	case "github-pr-check":
 		return runDoghouse(ctx, r, w, opt, isProject, false)
+	case "github-pr-check":
+		return runDoghouse(ctx, r, w, opt, isProject, true)
 	case "github-pr-review":
-		if os.Getenv("REVIEWDOG_GITHUB_API_TOKEN") == "" {
-			fmt.Fprintln(os.Stderr, "REVIEWDOG_GITHUB_API_TOKEN is not set")
-			return nil
-		}
 		gs, isPR, err := githubService(ctx, opt)
 		if err != nil {
 			return err
@@ -222,7 +275,21 @@ See -reporter flag for migration and set -reporter="github-pr-review" or -report
 			fmt.Fprintln(os.Stderr, "reviewdog: this is not PullRequest build.")
 			return nil
 		}
-		cs = reviewdog.MultiCommentService(gs, cs)
+		// If it's running in GitHub Actions and it's PR from forked repository,
+		// replace comment writer to GitHubActionLogWriter to create annotations
+		// instead of review comment because if it's PR from forked repository,
+		// GitHub token doesn't have write permission due to security concern and
+		// cannot post results via Review API.
+		if cienv.IsInGitHubAction() && cienv.HasReadOnlyPermissionGitHubToken() {
+			fmt.Fprintln(w, `reviewdog: This GitHub token doesn't have write permission of Review API [1], 
+so reviewdog will report results via logging command [2] and create annotations similar to
+github-pr-check reporter as a fallback.
+[1]: https://docs.github.com/en/actions/reference/events-that-trigger-workflows#pull_request_target, 
+[2]: https://help.github.com/en/actions/automating-your-workflow-with-github-actions/development-tools-for-github-actions#logging-commands`)
+			cs = githubutils.NewGitHubActionLogWriter(opt.level)
+		} else {
+			cs = reviewdog.MultiCommentService(gs, cs)
+		}
 		ds = gs
 	case "gitlab-mr-discussion":
 		build, cli, err := gitlabBuildWithClient()
@@ -264,20 +331,58 @@ See -reporter flag for migration and set -reporter="github-pr-review" or -report
 		if err != nil {
 			return err
 		}
-	case "local":
-		d, err := diffService(opt.diffCmd, opt.diffStrip)
+	case "gerrit-change-review":
+		b, cli, err := gerritBuildWithClient()
+		if err != nil {
+			return err
+		}
+		gc, err := gerritservice.NewChangeReviewCommenter(cli, b.GerritChangeID, b.GerritRevisionID)
+		if err != nil {
+			return err
+		}
+		cs = gc
+
+		d, err := gerritservice.NewChangeDiff(cli, b.Branch, b.GerritChangeID)
 		if err != nil {
 			return err
 		}
 		ds = d
-	}
-
-	if isProject {
-		conf, err := projectConfig(opt.conf)
+	case "bitbucket-code-report":
+		build, client, ct, err := bitbucketBuildWithClient(ctx)
 		if err != nil {
 			return err
 		}
-		return project.Run(ctx, conf, buildRunnersMap(opt.runners), cs, ds)
+		ctx = ct
+
+		cs = bbservice.NewReportAnnotator(client,
+			build.Owner, build.Repo, build.SHA, getRunnersList(opt, projectConf))
+
+		if !(opt.filterMode == filter.ModeDefault || opt.filterMode == filter.ModeNoFilter) {
+			// by default scan whole project with out diff (filter.ModeNoFilter)
+			// Bitbucket pipelines doesn't give an easy way to know
+			// which commit run pipeline before so we can compare between them
+			// however once PR is opened, Bitbucket Reports UI will do automatic
+			// filtering of annotations dividing them in two groups:
+			// - This pull request (10)
+			// - All (50)
+			log.Printf("reviewdog: [bitbucket-code-report] supports only with filter.ModeNoFilter for now")
+		}
+		opt.filterMode = filter.ModeNoFilter
+		ds = &reviewdog.EmptyDiff{}
+	case "local":
+		if opt.diffCmd == "" && opt.filterMode == filter.ModeNoFilter {
+			ds = &reviewdog.EmptyDiff{}
+		} else {
+			d, err := diffService(opt.diffCmd, opt.diffStrip)
+			if err != nil {
+				return err
+			}
+			ds = d
+		}
+	}
+
+	if isProject {
+		return project.Run(ctx, projectConf, buildRunnersMap(opt.runners), cs, ds, opt.tee, opt.filterMode, opt.failOnError)
 	}
 
 	p, err := newParserFromOpt(opt)
@@ -285,16 +390,19 @@ See -reporter flag for migration and set -reporter="github-pr-review" or -report
 		return err
 	}
 
-	app := reviewdog.NewReviewdog(toolName(opt), p, cs, ds)
+	app := reviewdog.NewReviewdog(toolName(opt), p, cs, ds, opt.filterMode, opt.failOnError)
 	return app.Run(ctx, r)
 }
 
 func runList(w io.Writer) error {
 	tabw := tabwriter.NewWriter(w, 0, 8, 0, '\t', 0)
+	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "rdjson", "Reviewdog Diagnostic JSON Format (JSON of DiagnosticResult message)", "https://github.com/reviewdog/reviewdog")
+	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "rdjsonl", "Reviewdog Diagnostic JSONL Format (JSONL of Diagnostic message)", "https://github.com/reviewdog/reviewdog")
+	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "diff", "Unified Diff Format", "https://en.wikipedia.org/wiki/Diff#Unified_format")
+	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "checkstyle", "checkstyle XML format", "http://checkstyle.sourceforge.net/")
 	for _, f := range sortedFmts(fmts.DefinedFmts()) {
 		fmt.Fprintf(tabw, "%s\t%s\t- %s\n", f.Name, f.Description, f.URL)
 	}
-	fmt.Fprintf(tabw, "%s\t%s\t- %s\n", "checkstyle", "checkstyle XML format", "http://checkstyle.sourceforge.net/")
 	return tabw.Flush()
 }
 
@@ -338,7 +446,7 @@ func insecureSkipVerify() bool {
 	return os.Getenv("REVIEWDOG_INSECURE_SKIP_VERIFY") == "true"
 }
 
-func githubService(ctx context.Context, opt *option) (gs *githubservice.GitHubPullRequest, isPR bool, err error) {
+func githubService(ctx context.Context, opt *option) (gs *githubservice.PullRequest, isPR bool, err error) {
 	token, err := nonEmptyEnv("REVIEWDOG_GITHUB_API_TOKEN")
 	if err != nil {
 		return nil, isPR, err
@@ -423,13 +531,25 @@ func githubClient(ctx context.Context, token string) (*github.Client, error) {
 const defaultGitHubAPI = "https://api.github.com/"
 
 func githubBaseURL() (*url.URL, error) {
-	baseURL := os.Getenv("GITHUB_API")
-	if baseURL == "" {
-		baseURL = defaultGitHubAPI
+	if baseURL := os.Getenv("GITHUB_API"); baseURL != "" {
+		u, err := url.Parse(baseURL)
+		if err != nil {
+			return nil, fmt.Errorf("GitHub base URL from GITHUB_API is invalid: %v, %w", baseURL, err)
+		}
+		return u, nil
 	}
-	u, err := url.Parse(baseURL)
+	// get GitHub base URL from GitHub Actions' default environment variable GITHUB_API_URL
+	// ref: https://docs.github.com/en/actions/reference/environment-variables#default-environment-variables
+	if baseURL := os.Getenv("GITHUB_API_URL"); baseURL != "" {
+		u, err := url.Parse(baseURL + "/")
+		if err != nil {
+			return nil, fmt.Errorf("GitHub base URL from GITHUB_API_URL is invalid: %v, %w", baseURL, err)
+		}
+		return u, nil
+	}
+	u, err := url.Parse(defaultGitHubAPI)
 	if err != nil {
-		return nil, fmt.Errorf("GitHub base URL is invalid: %v, %v", baseURL, err)
+		return nil, fmt.Errorf("GitHub base URL from reviewdog default is invalid: %v, %w", defaultGitHubAPI, err)
 	}
 	return u, nil
 }
@@ -463,6 +583,59 @@ func gitlabBuildWithClient() (*cienv.BuildInfo, *gitlab.Client, error) {
 	return g, client, err
 }
 
+func gerritBuildWithClient() (*cienv.BuildInfo, *gerrit.Client, error) {
+	buildInfo, err := cienv.GetGerritBuildInfo()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	gerritAddr := os.Getenv("GERRIT_ADDRESS")
+	if gerritAddr == "" {
+		return nil, nil, errors.New("cannot get gerrit host address from environment variable. Set GERRIT_ADDRESS ?")
+	}
+
+	username := os.Getenv("GERRIT_USERNAME")
+	password := os.Getenv("GERRIT_PASSWORD")
+	if username != "" && password != "" {
+		client := gerrit.NewClient(gerritAddr, gerrit.BasicAuth(username, password))
+		return buildInfo, client, nil
+	}
+
+	if useGitCookiePath := os.Getenv("GERRIT_GIT_COOKIE_PATH"); useGitCookiePath != "" {
+		client := gerrit.NewClient(gerritAddr, gerrit.GitCookieFileAuth(useGitCookiePath))
+		return buildInfo, client, nil
+	}
+
+	client := gerrit.NewClient(gerritAddr, gerrit.NoAuth)
+	return buildInfo, client, nil
+}
+
+func bitbucketBuildWithClient(ctx context.Context) (*cienv.BuildInfo, bbservice.APIClient, context.Context, error) {
+	build, _, err := cienv.GetBuildInfo()
+	if err != nil {
+		return nil, nil, ctx, err
+	}
+
+	bbUser := os.Getenv("BITBUCKET_USER")
+	bbPass := os.Getenv("BITBUCKET_PASSWORD")
+	bbAccessToken := os.Getenv("BITBUCKET_ACCESS_TOKEN")
+	bbServerURL := os.Getenv("BITBUCKET_SERVER_URL")
+
+	var client bbservice.APIClient
+	if bbServerURL != "" {
+		ctx, err = bbservice.BuildServerAPIContext(ctx, bbServerURL, bbUser, bbPass, bbAccessToken)
+		if err != nil {
+			return nil, nil, ctx, fmt.Errorf("failed to build context for Bitbucket API calls: %w", err)
+		}
+		client = bbservice.NewServerAPIClient()
+	} else {
+		ctx = bbservice.BuildCloudAPIContext(ctx, bbUser, bbPass, bbAccessToken)
+		client = bbservice.NewCloudAPIClient(cienv.IsInBitbucketPipeline(), cienv.IsInBitbucketPipe())
+	}
+
+	return build, client, ctx, nil
+}
+
 func fetchMergeRequestIDFromCommit(cli *gitlab.Client, projectID, sha string) (id int, err error) {
 	// https://docs.gitlab.com/ce/api/merge_requests.html#list-project-merge-requests
 	opt := &gitlab.ListProjectMergeRequestsOptions{
@@ -482,12 +655,12 @@ func fetchMergeRequestIDFromCommit(cli *gitlab.Client, projectID, sha string) (i
 }
 
 func gitlabClient(token string) (*gitlab.Client, error) {
-	client := gitlab.NewClient(newHTTPClient(), token)
 	baseURL, err := gitlabBaseURL()
 	if err != nil {
 		return nil, err
 	}
-	if err := client.SetBaseURL(baseURL.String()); err != nil {
+	client, err := gitlab.NewClient(token, gitlab.WithHTTPClient(newHTTPClient()), gitlab.WithBaseURL(baseURL.String()))
+	if err != nil {
 		return nil, err
 	}
 	return client, nil
@@ -496,13 +669,21 @@ func gitlabClient(token string) (*gitlab.Client, error) {
 const defaultGitLabAPI = "https://gitlab.com/api/v4"
 
 func gitlabBaseURL() (*url.URL, error) {
-	baseURL := os.Getenv("GITLAB_API")
-	if baseURL == "" {
+	gitlabAPI := os.Getenv("GITLAB_API")
+	gitlabV4URL := os.Getenv("CI_API_V4_URL")
+
+	var baseURL string
+	if gitlabAPI != "" {
+		baseURL = gitlabAPI
+	} else if gitlabV4URL != "" {
+		baseURL = gitlabV4URL
+	} else {
 		baseURL = defaultGitLabAPI
 	}
+
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("GitLab base URL is invalid: %v, %v", baseURL, err)
+		return nil, fmt.Errorf("GitLab base URL is invalid: %v, %w", baseURL, err)
 	}
 	return u, nil
 }
@@ -529,11 +710,11 @@ func (ss *strslice) Set(value string) error {
 func projectConfig(path string) (*project.Config, error) {
 	b, err := readConf(path)
 	if err != nil {
-		return nil, fmt.Errorf("fail to open config: %v", err)
+		return nil, fmt.Errorf("fail to open config: %w", err)
 	}
 	conf, err := project.Parse(b)
 	if err != nil {
-		return nil, fmt.Errorf("config is invalid: %v", err)
+		return nil, fmt.Errorf("config is invalid: %w", err)
 	}
 	return conf, nil
 }
@@ -559,10 +740,14 @@ func readConf(conf string) ([]byte, error) {
 	return nil, errors.New(".reviewdog.yml not found")
 }
 
-func newParserFromOpt(opt *option) (reviewdog.Parser, error) {
-	p, err := reviewdog.NewParser(&reviewdog.ParserOpt{FormatName: opt.f, Errorformat: opt.efms})
+func newParserFromOpt(opt *option) (parser.Parser, error) {
+	p, err := parser.New(&parser.Option{
+		FormatName:  opt.f,
+		DiffStrip:   opt.fDiffStrip,
+		Errorformat: opt.efms,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("fail to create parser. use either -f or -efm: %v", err)
+		return nil, fmt.Errorf("fail to create parser. use either -f or -efm: %w", err)
 	}
 	return p, err
 }
@@ -583,4 +768,27 @@ func buildRunnersMap(runners string) map[string]bool {
 		}
 	}
 	return m
+}
+
+func getRunnersList(opt *option, conf *project.Config) []string {
+	if len(opt.runners) > 0 { // if runners explicitly defined, use them
+		return strings.Split(opt.runners, ",")
+	}
+
+	if conf != nil { // if this is a Project run, and no explicitly provided runners
+		// if no runners explicitly provided
+		// get all runners from config
+		list := make([]string, 0, len(conf.Runner))
+		for runner := range conf.Runner {
+			list = append(list, runner)
+		}
+		return list
+	}
+
+	// if this is simple run, get the single tool name
+	if name := toolName(opt); name != "" {
+		return []string{name}
+	}
+
+	return []string{}
 }

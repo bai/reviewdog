@@ -6,7 +6,7 @@ import (
 	"net/http"
 
 	"github.com/bradleyfalzon/ghinstallation"
-	"github.com/google/go-github/v28/github"
+	"github.com/google/go-github/v38/github"
 )
 
 type NewGitHubClientOption struct {
@@ -30,7 +30,7 @@ func NewGitHubClient(ctx context.Context, opt *NewGitHubClientOption) (*github.C
 
 	itr, err := githubAppTransport(ctx, client, opt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create gh transport: %v", err)
+		return nil, fmt.Errorf("failed to create gh transport: %w", err)
 	}
 
 	client.Transport = itr

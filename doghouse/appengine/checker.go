@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/vvakame/sdlog/aelog"
 
 	"github.com/reviewdog/reviewdog/doghouse"
 	"github.com/reviewdog/reviewdog/doghouse/server"
@@ -20,6 +21,7 @@ type githubChecker struct {
 	integrationID    int
 	ghInstStore      storage.GitHubInstallationStore
 	ghRepoTokenStore storage.GitHubRepositoryTokenStore
+	tr               http.RoundTripper
 }
 
 func (gc *githubChecker) handleCheck(w http.ResponseWriter, r *http.Request) {
@@ -45,12 +47,14 @@ func (gc *githubChecker) handleCheck(w http.ResponseWriter, r *http.Request) {
 		PrivateKey:    gc.privateKey,
 		IntegrationID: gc.integrationID,
 		RepoOwner:     req.Owner,
-		Client:        &http.Client{},
+		Client: &http.Client{
+			Transport: gc.tr,
+		},
 	}
 
 	gh, err := server.NewGitHubClient(ctx, opt)
 	if err != nil {
-		log.Printf("[ERROR] failed to create GitHub client: %v\n", err)
+		aelog.Errorf(ctx, "failed to create GitHub client: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintln(w, err)
 		return
@@ -58,7 +62,7 @@ func (gc *githubChecker) handleCheck(w http.ResponseWriter, r *http.Request) {
 
 	res, err := server.NewChecker(&req, gh).Check(ctx)
 	if err != nil {
-		log.Printf("[ERROR] failed to run checker: %v\n", err)
+		aelog.Errorf(ctx, "failed to run checker: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintln(w, err)
 		return
@@ -75,10 +79,10 @@ func (gc *githubChecker) validateCheckRequest(ctx context.Context, w http.Respon
 		// Update Travis IP Address before checking IP to reduce the # of
 		// flaky errors when token is not present.
 		if err := ciutil.UpdateTravisCIIPAddrs(&http.Client{}); err != nil {
-			log.Printf("[ERROR] failed to update travis CI IP addresses: %v\n", err)
+			aelog.Errorf(ctx, "failed to update travis CI IP addresses: %v", err)
 		}
 	}
-	log.Printf("[INFO] Remote Addr: %s\n", r.RemoteAddr)
+	aelog.Infof(ctx, "Remote Addr: %s", ciutil.IPFromReq(r))
 	if ciutil.IsFromCI(r) {
 		// Skip token validation if it's from trusted CI providers.
 		return true
@@ -96,7 +100,7 @@ func (gc *githubChecker) validateCheckToken(ctx context.Context, w http.Response
 	}
 	_, wantToken, err := gc.ghRepoTokenStore.Get(ctx, owner, repo)
 	if err != nil {
-		log.Printf("[ERROR] failed to get repository (%s/%s) token: %v\n", owner, repo, err)
+		aelog.Errorf(ctx, "failed to get repository (%s/%s) token: %v", owner, repo, err)
 	}
 	if wantToken == nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -117,7 +121,7 @@ func githubRepoURL(ctx context.Context, r *http.Request, owner, repo string) str
 	return u.String()
 }
 
-func doghouseBaseURL(_ context.Context, r *http.Request) *url.URL {
+func doghouseBaseURL(ctx context.Context, r *http.Request) *url.URL {
 	scheme := ""
 	if r.URL != nil && r.URL.Scheme != "" {
 		scheme = r.URL.Scheme
@@ -127,7 +131,7 @@ func doghouseBaseURL(_ context.Context, r *http.Request) *url.URL {
 	}
 	u, err := url.Parse(scheme + "://" + r.Host)
 	if err != nil {
-		log.Printf("[ERROR] %v\n", err)
+		aelog.Errorf(ctx, "%v", err)
 	}
 	return u
 }

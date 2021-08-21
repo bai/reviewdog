@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 )
 
 var _ CommentService = &RawCommentWriter{}
@@ -20,7 +19,7 @@ func NewRawCommentWriter(w io.Writer) *RawCommentWriter {
 }
 
 func (s *RawCommentWriter) Post(_ context.Context, c *Comment) error {
-	_, err := fmt.Fprintln(s.w, strings.Join(c.CheckResult.Lines, "\n"))
+	_, err := fmt.Fprintln(s.w, c.Result.Diagnostic.OriginalOutput)
 	return err
 }
 
@@ -43,14 +42,16 @@ func NewUnifiedCommentWriter(w io.Writer) *UnifiedCommentWriter {
 }
 
 func (mc *UnifiedCommentWriter) Post(_ context.Context, c *Comment) error {
-	s := c.Path
-	if c.Lnum > 0 {
-		s += fmt.Sprintf(":%d", c.Lnum)
-		if c.Col > 0 {
-			s += fmt.Sprintf(":%d", c.Col)
+	loc := c.Result.Diagnostic.GetLocation()
+	s := loc.GetPath()
+	start := loc.GetRange().GetStart()
+	if start.GetLine() > 0 {
+		s += fmt.Sprintf(":%d", start.GetLine())
+		if start.GetColumn() > 0 {
+			s += fmt.Sprintf(":%d", start.GetColumn())
 		}
 	}
-	s += fmt.Sprintf(": [%s] %s", c.ToolName, c.Body)
+	s += fmt.Sprintf(": [%s] %s", c.ToolName, c.Result.Diagnostic.GetMessage())
 	_, err := fmt.Fprintln(mc.w, s)
 	return err
 }

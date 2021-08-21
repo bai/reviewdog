@@ -12,7 +12,9 @@ import (
 	"github.com/xanzy/go-gitlab"
 
 	"github.com/reviewdog/reviewdog"
-	"github.com/reviewdog/reviewdog/service/serviceutil"
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/proto/rdf"
+	"github.com/reviewdog/reviewdog/service/commentutil"
 )
 
 func TestGitLabMergeRequestCommitCommenter_Post_Flush_review_api(t *testing.T) {
@@ -46,7 +48,7 @@ func TestGitLabMergeRequestCommitCommenter_Post_Flush_review_api(t *testing.T) {
 			{
 				Path: "notExistFile.go",
 				Line: 1,
-				Note: serviceutil.BodyPrefix + "\nalready commented",
+				Note: commentutil.BodyPrefix + "already commented",
 			},
 		}
 		if err := json.NewEncoder(w).Encode(cs); err != nil {
@@ -65,7 +67,7 @@ func TestGitLabMergeRequestCommitCommenter_Post_Flush_review_api(t *testing.T) {
 		want := gitlab.CommitComment{
 			Path:     "notExistFile.go",
 			Line:     14,
-			Note:     serviceutil.BodyPrefix + "\nnew comment",
+			Note:     commentutil.BodyPrefix + "new comment",
 			LineType: "new",
 		}
 		if diff := pretty.Compare(want, req); diff != "" {
@@ -78,8 +80,11 @@ func TestGitLabMergeRequestCommitCommenter_Post_Flush_review_api(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	cli := gitlab.NewClient(nil, "")
-	cli.SetBaseURL(ts.URL + "/api/v4")
+	cli, err := gitlab.NewClient("", gitlab.WithBaseURL(ts.URL+"/api/v4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	g, err := NewGitLabMergeRequestCommitCommenter(cli, "o", "r", 14, "sha")
 	if err != nil {
 		t.Fatal(err)
@@ -88,18 +93,32 @@ func TestGitLabMergeRequestCommitCommenter_Post_Flush_review_api(t *testing.T) {
 	// If setting exists file path, sha is changed by last commit id.
 	comments := []*reviewdog.Comment{
 		{
-			CheckResult: &reviewdog.CheckResult{
-				Path: "notExistFile.go",
-				Lnum: 1,
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "notExistFile.go",
+						Range: &rdf.Range{Start: &rdf.Position{
+							Line: 1,
+						}},
+					},
+					Message: "already commented",
+				},
+				InDiffFile: true,
 			},
-			Body: "already commented",
 		},
 		{
-			CheckResult: &reviewdog.CheckResult{
-				Path: "notExistFile.go",
-				Lnum: 14,
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "notExistFile.go",
+						Range: &rdf.Range{Start: &rdf.Position{
+							Line: 14,
+						}},
+					},
+					Message: "new comment",
+				},
+				InDiffFile: true,
 			},
-			Body: "new comment",
 		},
 	}
 	for _, c := range comments {
@@ -129,8 +148,9 @@ func TestGitLabPullRequest_workdir(t *testing.T) {
 	}
 	ctx := context.Background()
 	want := "a/b/c"
-	g.Post(ctx, &reviewdog.Comment{CheckResult: &reviewdog.CheckResult{Path: want}})
-	if got := g.postComments[0].Path; got != want {
+	g.Post(ctx, &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{Location: &rdf.Location{Path: want}}}})
+	if got := g.postComments[0].Result.Diagnostic.GetLocation().GetPath(); got != want {
 		t.Errorf("wd=%q path=%q, want %q", g.wd, got, want)
 	}
 
@@ -144,8 +164,9 @@ func TestGitLabPullRequest_workdir(t *testing.T) {
 	}
 	path := "a/b/c"
 	wantPath := "cmd/" + path
-	g.Post(ctx, &reviewdog.Comment{CheckResult: &reviewdog.CheckResult{Path: path}})
-	if got := g.postComments[0].Path; got != wantPath {
+	g.Post(ctx, &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{Location: &rdf.Location{Path: want}}}})
+	if got := g.postComments[0].Result.Diagnostic.GetLocation().GetPath(); got != wantPath {
 		t.Errorf("wd=%q path=%q, want %q", g.wd, got, wantPath)
 	}
 }

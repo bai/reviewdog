@@ -1,6 +1,15 @@
 {
   "extends": [
-    "config:base"
+    "config:base",
+    ":semanticCommits"
   ],
-  "rangeStrategy": "replace"
+  "packageRules": [
+    {
+      "updateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    }
+  ],
+  "postUpdateOptions": ["gomodTidy"],
+  "rangeStrategy": "replace",
+  "labels": ["renovate"]
 }

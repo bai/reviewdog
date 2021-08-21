@@ -5,6 +5,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 )
 
 func TestUnifiedCommentWriter_Post(t *testing.T) {
@@ -14,45 +17,65 @@ func TestUnifiedCommentWriter_Post(t *testing.T) {
 	}{
 		{
 			in: &Comment{
-				CheckResult: &CheckResult{
-					Path: "/path/to/file",
+				Result: &filter.FilteredDiagnostic{
+					Diagnostic: &rdf.Diagnostic{
+						Location: &rdf.Location{Path: "/path/to/file"},
+						Message:  "message",
+					},
 				},
 				ToolName: "tool name",
-				Body:     "message",
 			},
 			want: `/path/to/file: [tool name] message`,
 		},
 		{
 			in: &Comment{
-				CheckResult: &CheckResult{
-					Path: "/path/to/file",
-					Col:  14,
+				Result: &filter.FilteredDiagnostic{
+					Diagnostic: &rdf.Diagnostic{
+						Location: &rdf.Location{
+							Path: "/path/to/file",
+							Range: &rdf.Range{Start: &rdf.Position{
+								Column: 14,
+							}},
+						},
+						Message: "message",
+					},
 				},
 				ToolName: "tool name",
-				Body:     "message",
 			},
 			want: `/path/to/file: [tool name] message`,
 		},
 		{
 			in: &Comment{
-				CheckResult: &CheckResult{
-					Path: "/path/to/file",
-					Lnum: 14,
+				Result: &filter.FilteredDiagnostic{
+					Diagnostic: &rdf.Diagnostic{
+						Location: &rdf.Location{
+							Path: "/path/to/file",
+							Range: &rdf.Range{Start: &rdf.Position{
+								Line: 14,
+							}},
+						},
+						Message: "message",
+					},
 				},
 				ToolName: "tool name",
-				Body:     "message",
 			},
 			want: `/path/to/file:14: [tool name] message`,
 		},
 		{
 			in: &Comment{
-				CheckResult: &CheckResult{
-					Path: "/path/to/file",
-					Lnum: 14,
-					Col:  7,
+				Result: &filter.FilteredDiagnostic{
+					Diagnostic: &rdf.Diagnostic{
+						Location: &rdf.Location{
+							Path: "/path/to/file",
+							Range: &rdf.Range{Start: &rdf.Position{
+								Line:   14,
+								Column: 7,
+							}},
+						},
+						Message: "line1\nline2",
+					},
 				},
 				ToolName: "tool name",
-				Body:     "line1\nline2",
 			},
 			want: `/path/to/file:14:7: [tool name] line1
 line2`,

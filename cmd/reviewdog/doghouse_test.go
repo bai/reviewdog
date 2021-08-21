@@ -3,19 +3,24 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/oauth2"
+	"google.golang.org/protobuf/testing/protocmp"
 
 	"github.com/reviewdog/reviewdog"
 	"github.com/reviewdog/reviewdog/cienv"
 	"github.com/reviewdog/reviewdog/doghouse"
 	"github.com/reviewdog/reviewdog/doghouse/client"
+	"github.com/reviewdog/reviewdog/filter"
 	"github.com/reviewdog/reviewdog/project"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 )
 
 func setupEnvs(testEnvs map[string]string) (cleanup func()) {
@@ -38,7 +43,7 @@ func setupEnvs(testEnvs map[string]string) (cleanup func()) {
 func TestNewDoghouseCli_returnGitHubClient(t *testing.T) {
 	cleanup := setupEnvs(map[string]string{
 		"REVIEWDOG_TOKEN":            "",
-		"GITHUB_ACTION":              "xxx",
+		"GITHUB_ACTIONS":             "xxx",
 		"REVIEWDOG_GITHUB_API_TOKEN": "xxx",
 	})
 	defer cleanup()
@@ -54,7 +59,7 @@ func TestNewDoghouseCli_returnGitHubClient(t *testing.T) {
 func TestNewDoghouseCli_returnErrorForGitHubClient(t *testing.T) {
 	cleanup := setupEnvs(map[string]string{
 		"REVIEWDOG_TOKEN":            "",
-		"GITHUB_ACTION":              "xxx",
+		"GITHUB_ACTIONS":             "true",
 		"REVIEWDOG_GITHUB_API_TOKEN": "", // missing
 	})
 	defer cleanup()
@@ -66,7 +71,7 @@ func TestNewDoghouseCli_returnErrorForGitHubClient(t *testing.T) {
 func TestNewDoghouseCli_returnDogHouseClientWithReviewdogToken(t *testing.T) {
 	cleanup := setupEnvs(map[string]string{
 		"REVIEWDOG_TOKEN":            "xxx",
-		"GITHUB_ACTION":              "xxx",
+		"GITHUB_ACTIONS":             "true",
 		"REVIEWDOG_GITHUB_API_TOKEN": "xxx",
 	})
 	defer cleanup()
@@ -82,7 +87,7 @@ func TestNewDoghouseCli_returnDogHouseClientWithReviewdogToken(t *testing.T) {
 func TestNewDoghouseCli_returnDogHouseClient(t *testing.T) {
 	cleanup := setupEnvs(map[string]string{
 		"REVIEWDOG_TOKEN":            "",
-		"GITHUB_ACTION":              "",
+		"GITHUB_ACTIONS":             "",
 		"REVIEWDOG_GITHUB_API_TOKEN": "",
 	})
 	defer cleanup()
@@ -110,23 +115,27 @@ func TestNewDoghouseServerCli(t *testing.T) {
 	}
 }
 
-func TestCheckResultSet_Project(t *testing.T) {
-	defer func(f func(ctx context.Context, conf *project.Config, runners map[string]bool, level string) (*reviewdog.ResultMap, error)) {
+func TestDiagnosticResultSet_Project(t *testing.T) {
+	defer func(f func(ctx context.Context, conf *project.Config, runners map[string]bool, level string, tee bool) (*reviewdog.ResultMap, error)) {
 		projectRunAndParse = f
 	}(projectRunAndParse)
 
-	var wantCheckResult reviewdog.ResultMap
-	wantCheckResult.Store("name1", &reviewdog.Result{CheckResults: []*reviewdog.CheckResult{
+	var wantDiagnosticResult reviewdog.ResultMap
+	wantDiagnosticResult.Store("name1", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{
 		{
-			Lnum:    1,
-			Col:     14,
+			Location: &rdf.Location{
+				Range: &rdf.Range{Start: &rdf.Position{
+					Line:   1,
+					Column: 14,
+				}},
+				Path: "reviewdog.go",
+			},
 			Message: "msg",
-			Path:    "reviewdog.go",
 		},
 	}})
 
-	projectRunAndParse = func(ctx context.Context, conf *project.Config, runners map[string]bool, level string) (*reviewdog.ResultMap, error) {
-		return &wantCheckResult, nil
+	projectRunAndParse = func(ctx context.Context, conf *project.Config, runners map[string]bool, level string, tee bool) (*reviewdog.ResultMap, error) {
+		return &wantDiagnosticResult, nil
 	}
 
 	tmp, err := ioutil.TempFile("", "")
@@ -140,18 +149,18 @@ func TestCheckResultSet_Project(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got.Len() != wantCheckResult.Len() {
-		t.Errorf("length of results is different. got = %d, want = %d\n", got.Len(), wantCheckResult.Len())
+	if got.Len() != wantDiagnosticResult.Len() {
+		t.Errorf("length of results is different. got = %d, want = %d\n", got.Len(), wantDiagnosticResult.Len())
 	}
 	got.Range(func(k string, r *reviewdog.Result) {
-		w, _ := wantCheckResult.Load(k)
-		if diff := cmp.Diff(r, w); diff != "" {
+		w, _ := wantDiagnosticResult.Load(k)
+		if diff := cmp.Diff(r, w, protocmp.Transform()); diff != "" {
 			t.Errorf("result has diff:\n%s", diff)
 		}
 	})
 }
 
-func TestCheckResultSet_NonProject(t *testing.T) {
+func TestDiagnosticResultSet_NonProject(t *testing.T) {
 	opt := &option{
 		f: "golint",
 	}
@@ -161,13 +170,17 @@ func TestCheckResultSet_NonProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	var want reviewdog.ResultMap
-	want.Store("golint", &reviewdog.Result{CheckResults: []*reviewdog.CheckResult{
+	want.Store("golint", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{
 		{
-			Lnum:    14,
-			Col:     14,
-			Message: "test message",
-			Path:    "reviewdog.go",
-			Lines:   []string{input},
+			Location: &rdf.Location{
+				Range: &rdf.Range{Start: &rdf.Position{
+					Line:   14,
+					Column: 14,
+				}},
+				Path: "reviewdog.go",
+			},
+			Message:        "test message",
+			OriginalOutput: input,
 		},
 	}})
 
@@ -176,7 +189,7 @@ func TestCheckResultSet_NonProject(t *testing.T) {
 	}
 	got.Range(func(k string, r *reviewdog.Result) {
 		w, _ := want.Load(k)
-		if diff := cmp.Diff(r, w); diff != "" {
+		if diff := cmp.Diff(r, w, protocmp.Transform()); diff != "" {
 			t.Errorf("result has diff:\n%s", diff)
 		}
 	})
@@ -217,26 +230,42 @@ func TestPostResultSet_withReportURL(t *testing.T) {
 		case "name1":
 			if diff := cmp.Diff(req.Annotations, []*doghouse.Annotation{
 				{
-					Line:       14,
-					Message:    "name1: test 1",
-					Path:       "reviewdog.go",
-					RawMessage: "L1\nL2",
+					Diagnostic: &rdf.Diagnostic{
+						Message: "name1: test 1",
+						Location: &rdf.Location{
+							Path: "cmd/reviewdog/reviewdog.go",
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 14},
+							},
+						},
+						OriginalOutput: "L1\nL2",
+					},
 				},
 				{
-					Message: "name1: test 2",
-					Path:    "reviewdog.go",
+					Diagnostic: &rdf.Diagnostic{
+						Message: "name1: test 2",
+						Location: &rdf.Location{
+							Path: "cmd/reviewdog/reviewdog.go",
+						},
+					},
 				},
-			}); diff != "" {
+			}, protocmp.Transform()); diff != "" {
 				t.Errorf("%s: req.Annotation have diff:\n%s", req.Name, diff)
 			}
 		case "name2":
 			if diff := cmp.Diff(req.Annotations, []*doghouse.Annotation{
 				{
-					Line:    14,
-					Message: "name2: test 1",
-					Path:    "cmd/reviewdog/doghouse.go",
+					Diagnostic: &rdf.Diagnostic{
+						Message: "name2: test 1",
+						Location: &rdf.Location{
+							Path: "cmd/reviewdog/doghouse.go",
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 14},
+							},
+						},
+					},
 				},
-			}); diff != "" {
+			}, protocmp.Transform()); diff != "" {
 				t.Errorf("%s: req.Annotation have diff:\n%s", req.Name, diff)
 			}
 		default:
@@ -245,24 +274,35 @@ func TestPostResultSet_withReportURL(t *testing.T) {
 		return &doghouse.CheckResponse{ReportURL: "xxx"}, nil
 	}
 
+	// It assumes the current dir is ./cmd/reviewdog/
 	var resultSet reviewdog.ResultMap
-	resultSet.Store("name1", &reviewdog.Result{CheckResults: []*reviewdog.CheckResult{
+	resultSet.Store("name1", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{
 		{
-			Lnum:    14,
-			Message: "name1: test 1",
-			Path:    "reviewdog.go",
-			Lines:   []string{"L1", "L2"},
+			Location: &rdf.Location{
+				Range: &rdf.Range{Start: &rdf.Position{
+					Line: 14,
+				}},
+				Path: "reviewdog.go", // test relative path
+			},
+			Message:        "name1: test 1",
+			OriginalOutput: "L1\nL2",
 		},
 		{
+			Location: &rdf.Location{
+				Path: absPath(t, "reviewdog.go"), // test abs path
+			},
 			Message: "name1: test 2",
-			Path:    "reviewdog.go",
 		},
 	}})
-	resultSet.Store("name2", &reviewdog.Result{CheckResults: []*reviewdog.CheckResult{
+	resultSet.Store("name2", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{
 		{
-			Lnum:    14,
+			Location: &rdf.Location{
+				Range: &rdf.Range{Start: &rdf.Position{
+					Line: 14,
+				}},
+				Path: "doghouse.go",
+			},
 			Message: "name2: test 1",
-			Path:    "cmd/reviewdog/doghouse.go",
 		},
 	}})
 
@@ -273,7 +313,8 @@ func TestPostResultSet_withReportURL(t *testing.T) {
 		SHA:         sha,
 	}
 
-	if _, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli); err != nil {
+	opt := &option{filterMode: filter.ModeAdded}
+	if _, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli, opt); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -286,18 +327,19 @@ func TestPostResultSet_withoutReportURL(t *testing.T) {
 		sha   = "1414"
 	)
 
-	wantResults := []*reviewdog.FilteredCheck{{LnumDiff: 1}}
+	wantResults := []*filter.FilteredDiagnostic{{ShouldReport: true}}
 	fakeCli := &fakeDoghouseServerCli{}
 	fakeCli.FakeCheck = func(ctx context.Context, req *doghouse.CheckRequest) (*doghouse.CheckResponse, error) {
 		return &doghouse.CheckResponse{CheckedResults: wantResults}, nil
 	}
 
 	var resultSet reviewdog.ResultMap
-	resultSet.Store("name1", &reviewdog.Result{CheckResults: []*reviewdog.CheckResult{}})
+	resultSet.Store("name1", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{}})
 
 	ghInfo := &cienv.BuildInfo{Owner: owner, Repo: repo, PullRequest: prNum, SHA: sha}
 
-	resp, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli)
+	opt := &option{filterMode: filter.ModeAdded}
+	resp, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,8 +350,49 @@ func TestPostResultSet_withoutReportURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("should have result for name1: %v", err)
 	}
-	if diff := cmp.Diff(results, wantResults); diff != "" {
+	if diff := cmp.Diff(results.FilteredDiagnostic, wantResults, protocmp.Transform()); diff != "" {
 		t.Errorf("results has diff:\n%s", diff)
+	}
+}
+
+func TestPostResultSet_conclusion(t *testing.T) {
+	const (
+		owner = "haya14busa"
+		repo  = "reviewdog"
+		prNum = 14
+		sha   = "1414"
+	)
+
+	fakeCli := &fakeDoghouseServerCli{}
+	var resultSet reviewdog.ResultMap
+	resultSet.Store("name1", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{}})
+	ghInfo := &cienv.BuildInfo{Owner: owner, Repo: repo, PullRequest: prNum, SHA: sha}
+
+	tests := []struct {
+		conclusion  string
+		failOnError bool
+		wantErr     bool
+	}{
+		{conclusion: "failure", failOnError: true, wantErr: true},
+		{conclusion: "neutral", failOnError: true, wantErr: false},
+		{conclusion: "success", failOnError: true, wantErr: false},
+		{conclusion: "", failOnError: true, wantErr: false},
+		{conclusion: "failure", failOnError: false, wantErr: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		fakeCli.FakeCheck = func(ctx context.Context, req *doghouse.CheckRequest) (*doghouse.CheckResponse, error) {
+			return &doghouse.CheckResponse{ReportURL: "xxx", Conclusion: tt.conclusion}, nil
+		}
+		opt := &option{filterMode: filter.ModeAdded, failOnError: tt.failOnError}
+		id := fmt.Sprintf("[conclusion=%s, failOnError=%v]", tt.conclusion, tt.failOnError)
+		_, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli, opt)
+		if tt.wantErr && err == nil {
+			t.Errorf("[%s] want err, but got nil.", id)
+		} else if !tt.wantErr && err != nil {
+			t.Errorf("[%s] got unexpected error: %v", id, err)
+		}
 	}
 }
 
@@ -327,90 +410,143 @@ func TestPostResultSet_withEmptyResponse(t *testing.T) {
 	}
 
 	var resultSet reviewdog.ResultMap
-	resultSet.Store("name1", &reviewdog.Result{CheckResults: []*reviewdog.CheckResult{}})
+	resultSet.Store("name1", &reviewdog.Result{Diagnostics: []*rdf.Diagnostic{}})
 
 	ghInfo := &cienv.BuildInfo{Owner: owner, Repo: repo, PullRequest: prNum, SHA: sha}
 
-	if _, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli); err == nil {
+	opt := &option{filterMode: filter.ModeAdded}
+	if _, err := postResultSet(context.Background(), &resultSet, ghInfo, fakeCli, opt); err == nil {
 		t.Error("got no error but want report missing error")
 	}
 }
 
 func TestReportResults(t *testing.T) {
-	filteredResultSet := new(reviewdog.FilteredCheckMap)
-	filteredResultSet.Store("name1", []*reviewdog.FilteredCheck{
-		{
-			CheckResult: &reviewdog.CheckResult{
-				Lines: []string{"name1-L1", "name1-L2"},
+	cleanup := setupEnvs(map[string]string{
+		"GITHUB_ACTIONS":    "",
+		"GITHUB_EVENT_PATH": "",
+	})
+	defer cleanup()
+	filteredResultSet := new(reviewdog.FilteredResultMap)
+	filteredResultSet.Store("name1", &reviewdog.FilteredResult{
+		FilteredDiagnostic: []*filter.FilteredDiagnostic{
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1-L1\nname1-L2",
+				},
+				ShouldReport: true,
 			},
-			InDiff: true,
-		},
-		{
-			CheckResult: &reviewdog.CheckResult{
-				Lines: []string{"name1.2-L1", "name1.2-L2"},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1.2-L1\nname1.2-L2",
+				},
+				ShouldReport: false,
 			},
-			InDiff: false,
 		},
 	})
-	filteredResultSet.Store("name2", []*reviewdog.FilteredCheck{
-		{
-			CheckResult: &reviewdog.CheckResult{
-				Lines: []string{"name1-L1", "name1-L2"},
+	filteredResultSet.Store("name2", &reviewdog.FilteredResult{
+		FilteredDiagnostic: []*filter.FilteredDiagnostic{
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1-L1\nname1-L2",
+				},
+				ShouldReport: false,
 			},
-			InDiff: false,
 		},
 	})
 	stdout := new(bytes.Buffer)
-	foundResultInDiff := reportResults(stdout, filteredResultSet)
-	if !foundResultInDiff {
-		t.Errorf("foundResultInDiff = %v, want true", foundResultInDiff)
+	foundResultShouldReport := reportResults(stdout, filteredResultSet)
+	if !foundResultShouldReport {
+		t.Errorf("foundResultShouldReport = %v, want true", foundResultShouldReport)
 	}
-	want := `reviwedog: Reporting results for "name1"
+	want := `reviewdog: Reporting results for "name1"
 name1-L1
 name1-L2
-reviwedog: Reporting results for "name2"
-reviwedog: No results found for "name2". 1 results found outside diff.
+reviewdog: Reporting results for "name2"
+reviewdog: No results found for "name2". 1 results found outside diff.
 `
 	if got := stdout.String(); got != want {
 		t.Errorf("diff found for report:\ngot:\n%s\nwant:\n%s", got, want)
 	}
 }
 
-func TestReportResults_noResultsInDiff(t *testing.T) {
-	filteredResultSet := new(reviewdog.FilteredCheckMap)
-	filteredResultSet.Store("name1", []*reviewdog.FilteredCheck{
-		{
-			CheckResult: &reviewdog.CheckResult{
-				Lines: []string{"name1-L1", "name1-L2"},
-			},
-			InDiff: false,
-		},
-		{
-			CheckResult: &reviewdog.CheckResult{
-				Lines: []string{"name1.2-L1", "name1.2-L2"},
-			},
-			InDiff: false,
-		},
+func TestReportResults_inGitHubAction(t *testing.T) {
+	cleanup := setupEnvs(map[string]string{
+		"GITHUB_ACTIONS":    "true",
+		"GITHUB_EVENT_PATH": "",
 	})
-	filteredResultSet.Store("name2", []*reviewdog.FilteredCheck{
-		{
-			CheckResult: &reviewdog.CheckResult{
-				Lines: []string{"name1-L1", "name1-L2"},
+	defer cleanup()
+	filteredResultSet := new(reviewdog.FilteredResultMap)
+	filteredResultSet.Store("name1", &reviewdog.FilteredResult{
+		FilteredDiagnostic: []*filter.FilteredDiagnostic{
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1-L1\nname1-L2",
+				},
+				ShouldReport: true,
 			},
-			InDiff: false,
 		},
 	})
 	stdout := new(bytes.Buffer)
-	foundResultInDiff := reportResults(stdout, filteredResultSet)
-	if foundResultInDiff {
-		t.Errorf("foundResultInDiff = %v, want false", foundResultInDiff)
-	}
-	want := `reviwedog: Reporting results for "name1"
-reviwedog: No results found for "name1". 2 results found outside diff.
-reviwedog: Reporting results for "name2"
-reviwedog: No results found for "name2". 1 results found outside diff.
+	_ = reportResults(stdout, filteredResultSet)
+	want := `reviewdog: Reporting results for "name1"
 `
 	if got := stdout.String(); got != want {
 		t.Errorf("diff found for report:\ngot:\n%s\nwant:\n%s", got, want)
 	}
+}
+
+func TestReportResults_noResultsShouldReport(t *testing.T) {
+	cleanup := setupEnvs(map[string]string{
+		"GITHUB_ACTIONS":    "",
+		"GITHUB_EVENT_PATH": "",
+	})
+	defer cleanup()
+	filteredResultSet := new(reviewdog.FilteredResultMap)
+	filteredResultSet.Store("name1", &reviewdog.FilteredResult{
+		FilteredDiagnostic: []*filter.FilteredDiagnostic{
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1-L1\nname1-L2",
+				},
+				ShouldReport: false,
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1.2-L1\nname1.2-L2",
+				},
+				ShouldReport: false,
+			},
+		},
+	})
+	filteredResultSet.Store("name2", &reviewdog.FilteredResult{
+		FilteredDiagnostic: []*filter.FilteredDiagnostic{
+			{
+				Diagnostic: &rdf.Diagnostic{
+					OriginalOutput: "name1-L1\nname1-L2",
+				},
+				ShouldReport: false,
+			},
+		},
+	})
+	stdout := new(bytes.Buffer)
+	foundResultShouldReport := reportResults(stdout, filteredResultSet)
+	if foundResultShouldReport {
+		t.Errorf("foundResultShouldReport = %v, want false", foundResultShouldReport)
+	}
+	want := `reviewdog: Reporting results for "name1"
+reviewdog: No results found for "name1". 2 results found outside diff.
+reviewdog: Reporting results for "name2"
+reviewdog: No results found for "name2". 1 results found outside diff.
+`
+	if got := stdout.String(); got != want {
+		t.Errorf("diff found for report:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func absPath(t *testing.T, path string) string {
+	p, err := filepath.Abs(path)
+	if err != nil {
+		t.Errorf("filepath.Abs(%q) failed: %v", path, err)
+	}
+	return p
 }

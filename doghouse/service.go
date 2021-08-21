@@ -1,6 +1,9 @@
 package doghouse
 
-import "github.com/reviewdog/reviewdog"
+import (
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/proto/rdf"
+)
 
 // CheckRequest represents doghouse GitHub check request.
 type CheckRequest struct {
@@ -31,7 +34,21 @@ type CheckRequest struct {
 
 	// Level is report level for this request.
 	// One of ["info", "warning", "error"]. Default is "error".
+	// Optional.
 	Level string `json:"level"`
+
+	// Deprecated: Use FilterMode == filter.NoFilter instead.
+	//
+	// OutsideDiff represents whether it report results in outside diff or not as
+	// annotations. It's useful only when PullRequest != 0. If PullRequest is
+	// empty, it will always report results all resutls including outside diff
+	// (because there are no diff!).
+	// Optional.
+	OutsideDiff bool `json:"outside_diff"`
+
+	// FilterMode represents a way to filter checks results
+	// Optional.
+	FilterMode filter.Mode `json:"filter_mode"`
 }
 
 // CheckResponse represents doghouse GitHub check response.
@@ -48,21 +65,28 @@ type CheckResponse struct {
 	// TODO(haya14busa): Consider to move this type to this package to avoid
 	// (cyclic) import.
 	// Optional.
-	CheckedResults []*reviewdog.FilteredCheck
+	CheckedResults []*filter.FilteredDiagnostic `json:"checked_results"`
+
+	// Conclusion of check result, which is same as GitHub's conclusion of Check
+	// API. https://developer.github.com/v3/checks/runs/#parameters-1
+	Conclusion string `json:"conclusion,omitempty"`
 }
 
 // Annotation represents an annotation to file or specific line.
 type Annotation struct {
-	// Relative file path
-	// Required.
+	// Diagnostic.Location.Path must be relative path to the project root.
+	// Optional.
+	Diagnostic *rdf.Diagnostic `json:"diagnostic,omitempty"`
+
+	// DEPRECATED fields below. Need to support them for the old reviewdog CLI
+	// version.
+
+	// DEPRECATED: Use Diagnostic.
 	Path string `json:"path,omitempty"`
-	// Line number.
-	// Optional.
+	// DEPRECATED: Use Diagnostic.
 	Line int `json:"line,omitempty"`
-	// Annotation message.
-	// Required.
+	// DEPRECATED: Use Diagnostic.
 	Message string `json:"message,omitempty"`
-	// Original error message of this annotation.
-	// Optional.
+	// DEPRECATED: Use Diagnostic.
 	RawMessage string `json:"raw_message,omitempty"`
 }

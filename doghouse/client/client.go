@@ -49,12 +49,12 @@ func New(client *http.Client) *DogHouseClient {
 
 // Check send check requests to doghouse.
 func (c *DogHouseClient) Check(ctx context.Context, req *doghouse.CheckRequest) (*doghouse.CheckResponse, error) {
-	url := c.BaseURL.String() + "/check"
+	checkURL := c.BaseURL.String() + "/check"
 	b, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	httpReq, err := http.NewRequest(http.MethodPost, checkURL, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +64,7 @@ func (c *DogHouseClient) Check(ctx context.Context, req *doghouse.CheckRequest) 
 
 	httpResp, err := c.Client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("Check request failed: %v", err)
+		return nil, fmt.Errorf("Check request failed: %w", err)
 	}
 	defer httpResp.Body.Close()
 
@@ -79,7 +79,7 @@ func (c *DogHouseClient) Check(ctx context.Context, req *doghouse.CheckRequest) 
 
 	var resp doghouse.CheckResponse
 	if err := json.Unmarshal(respb, &resp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: error=%v, resp=%s", err, respb)
+		return nil, fmt.Errorf("failed to decode response: error=%w, resp=%s", err, respb)
 	}
 	return &resp, nil
 }

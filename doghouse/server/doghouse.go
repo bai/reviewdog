@@ -8,11 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-github/v28/github"
+	"github.com/google/go-github/v38/github"
 
-	"github.com/reviewdog/reviewdog"
 	"github.com/reviewdog/reviewdog/diff"
 	"github.com/reviewdog/reviewdog/doghouse"
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 	"github.com/reviewdog/reviewdog/service/github/githubutils"
 )
 
@@ -39,21 +40,24 @@ func NewChecker(req *doghouse.CheckRequest, gh *github.Client) *Checker {
 }
 
 func (ch *Checker) Check(ctx context.Context) (*doghouse.CheckResponse, error) {
-
-	filterByDiff := ch.req.PullRequest != 0
-
 	var filediffs []*diff.FileDiff
 	if ch.req.PullRequest != 0 {
 		var err error
 		filediffs, err = ch.pullRequestDiff(ctx, ch.req.PullRequest)
 		if err != nil {
-			return nil, fmt.Errorf("fail to parse diff: %v", err)
+			return nil, fmt.Errorf("fail to parse diff: %w", err)
 		}
 	}
 
-	results := annotationsToCheckResults(ch.req.Annotations)
-	filtered := reviewdog.FilterCheck(results, filediffs, 1, "")
-
+	results := annotationsToDiagnostics(ch.req.Annotations)
+	filterMode := ch.req.FilterMode
+	//lint:ignore SA1019 Need to support OutsideDiff for backward compatibility.
+	if ch.req.PullRequest == 0 || ch.req.OutsideDiff {
+		// If it's not Pull Request run, do not filter results by diff regardless
+		// of the filter mode.
+		filterMode = filter.ModeNoFilter
+	}
+	filtered := filter.FilterCheck(results, filediffs, 1, "", filterMode)
 	check, err := ch.createCheck(ctx)
 	if err != nil {
 		// If this error is StatusForbidden (403) here, it means reviewdog is
@@ -65,29 +69,32 @@ func (ch *Checker) Check(ctx context.Context) (*doghouse.CheckResponse, error) {
 		if err, ok := err.(*github.ErrorResponse); ok && err.Response.StatusCode == http.StatusForbidden {
 			return &doghouse.CheckResponse{CheckedResults: filtered}, nil
 		}
-		return nil, fmt.Errorf("failed to create check: %v", err)
+		return nil, fmt.Errorf("failed to create check: %w", err)
 	}
 
-	checkRun, err := ch.postCheck(ctx, check.GetID(), filtered, filterByDiff)
+	checkRun, conclusion, err := ch.postCheck(ctx, check.GetID(), filtered)
 	if err != nil {
-		return nil, fmt.Errorf("failed to post result: %v", err)
+		return nil, fmt.Errorf("failed to post result: %w", err)
 	}
 	res := &doghouse.CheckResponse{
-		ReportURL: checkRun.GetHTMLURL(),
+		ReportURL:  checkRun.GetHTMLURL(),
+		Conclusion: conclusion,
 	}
 	return res, nil
 }
 
-func (ch *Checker) postCheck(ctx context.Context, checkID int64, checks []*reviewdog.FilteredCheck, filterByDiff bool) (*github.CheckRun, error) {
+func (ch *Checker) postCheck(ctx context.Context, checkID int64, checks []*filter.FilteredDiagnostic) (*github.CheckRun, string, error) {
 	var annotations []*github.CheckRunAnnotation
 	for _, c := range checks {
-		if !c.InDiff && filterByDiff {
+		if !c.ShouldReport {
 			continue
 		}
 		annotations = append(annotations, ch.toCheckRunAnnotation(c))
 	}
-	if err := ch.postAnnotations(ctx, checkID, annotations); err != nil {
-		return nil, fmt.Errorf("failed to post annotations: %v", err)
+	if len(annotations) > 0 {
+		if err := ch.postAnnotations(ctx, checkID, annotations); err != nil {
+			return nil, "", fmt.Errorf("failed to post annotations: %w", err)
+		}
 	}
 
 	conclusion := "success"
@@ -104,7 +111,11 @@ func (ch *Checker) postCheck(ctx context.Context, checkID int64, checks []*revie
 			Summary: github.String(ch.summary(checks)),
 		},
 	}
-	return ch.gh.UpdateCheckRun(ctx, ch.req.Owner, ch.req.Repo, checkID, opt)
+	checkRun, err := ch.gh.UpdateCheckRun(ctx, ch.req.Owner, ch.req.Repo, checkID, opt)
+	if err != nil {
+		return nil, "", err
+	}
+	return checkRun, conclusion, nil
 }
 
 func (ch *Checker) createCheck(ctx context.Context) (*github.CheckRun, error) {
@@ -121,7 +132,7 @@ func (ch *Checker) postAnnotations(ctx context.Context, checkID int64, annotatio
 		Name: ch.checkName(),
 		Output: &github.CheckRunOutput{
 			Title:       github.String(ch.checkTitle()),
-			Summary:     github.String(""), // Post summary with the last reqeust.
+			Summary:     github.String(""), // Post summary with the last request.
 			Annotations: annotations[:min(maxAnnotationsPerRequest, len(annotations))],
 		},
 	}
@@ -158,7 +169,20 @@ func (ch *Checker) conclusion() string {
 }
 
 // https://developer.github.com/v3/checks/runs/#annotations-object
-func (ch *Checker) annotationLevel() string {
+func (ch *Checker) annotationLevel(s rdf.Severity) string {
+	switch s {
+	case rdf.Severity_ERROR:
+		return "failure"
+	case rdf.Severity_WARNING:
+		return "warning"
+	case rdf.Severity_INFO:
+		return "notice"
+	default:
+		return ch.reqAnnotationLevel()
+	}
+}
+
+func (ch *Checker) reqAnnotationLevel() string {
 	switch strings.ToLower(ch.req.Level) {
 	case "info":
 		return "notice"
@@ -170,14 +194,14 @@ func (ch *Checker) annotationLevel() string {
 	return "failure"
 }
 
-func (ch *Checker) summary(checks []*reviewdog.FilteredCheck) string {
+func (ch *Checker) summary(checks []*filter.FilteredDiagnostic) string {
 	var lines []string
 	lines = append(lines, "reported by [reviewdog](https://github.com/reviewdog/reviewdog) :dog:")
 
-	var findings []*reviewdog.FilteredCheck
-	var filteredFindings []*reviewdog.FilteredCheck
+	var findings []*filter.FilteredDiagnostic
+	var filteredFindings []*filter.FilteredDiagnostic
 	for _, c := range checks {
-		if c.InDiff {
+		if c.ShouldReport {
 			findings = append(findings, c)
 		} else {
 			filteredFindings = append(filteredFindings, c)
@@ -189,7 +213,7 @@ func (ch *Checker) summary(checks []*reviewdog.FilteredCheck) string {
 	return strings.Join(lines, "\n")
 }
 
-func (ch *Checker) summaryFindings(name string, checks []*reviewdog.FilteredCheck) []string {
+func (ch *Checker) summaryFindings(name string, checks []*filter.FilteredDiagnostic) []string {
 	var lines []string
 	lines = append(lines, "<details>")
 	lines = append(lines, fmt.Sprintf("<summary>%s (%d)</summary>", name, len(checks)))
@@ -199,28 +223,66 @@ func (ch *Checker) summaryFindings(name string, checks []*reviewdog.FilteredChec
 			lines = append(lines, "... (Too many findings. Dropped some findings)")
 			break
 		}
-		lines = append(lines, githubutils.LinkedMarkdownCheckResult(
-			ch.req.Owner, ch.req.Repo, ch.req.SHA, c.CheckResult))
+		lines = append(lines, githubutils.LinkedMarkdownDiagnostic(
+			ch.req.Owner, ch.req.Repo, ch.req.SHA, c.Diagnostic))
 	}
 	lines = append(lines, "</details>")
 	return lines
 }
 
-func (ch *Checker) toCheckRunAnnotation(c *reviewdog.FilteredCheck) *github.CheckRunAnnotation {
+func (ch *Checker) toCheckRunAnnotation(c *filter.FilteredDiagnostic) *github.CheckRunAnnotation {
+	loc := c.Diagnostic.GetLocation()
+	startLine := int(loc.GetRange().GetStart().GetLine())
+	endLine := int(loc.GetRange().GetEnd().GetLine())
+	if endLine == 0 {
+		endLine = startLine
+	}
 	a := &github.CheckRunAnnotation{
-		Path:            github.String(c.Path),
-		StartLine:       github.Int(c.Lnum),
-		EndLine:         github.Int(c.Lnum),
-		AnnotationLevel: github.String(ch.annotationLevel()),
-		Message:         github.String(c.Message),
+		Path:            github.String(loc.GetPath()),
+		StartLine:       github.Int(startLine),
+		EndLine:         github.Int(endLine),
+		AnnotationLevel: github.String(ch.annotationLevel(c.Diagnostic.Severity)),
+		Message:         github.String(c.Diagnostic.GetMessage()),
+		Title:           github.String(ch.buildTitle(c)),
 	}
-	if ch.req.Name != "" {
-		a.Title = github.String(fmt.Sprintf("[%s] %s#L%d", ch.req.Name, c.Path, c.Lnum))
+	// Annotations only support start_column and end_column on the same line.
+	if startLine == endLine {
+		if s, e := loc.GetRange().GetStart().GetColumn(), loc.GetRange().GetEnd().GetColumn(); s != 0 && e != 0 {
+			a.StartColumn = github.Int(int(s))
+			a.EndColumn = github.Int(int(e))
+		}
 	}
-	if s := strings.Join(c.Lines, "\n"); s != "" {
+	if s := c.Diagnostic.GetOriginalOutput(); s != "" {
 		a.RawDetails = github.String(s)
 	}
 	return a
+}
+
+func (ch *Checker) buildTitle(c *filter.FilteredDiagnostic) string {
+	var sb strings.Builder
+	toolName := c.Diagnostic.GetSource().GetName()
+	if toolName == "" {
+		toolName = ch.req.Name
+	}
+	if toolName != "" {
+		sb.WriteString(fmt.Sprintf("[%s] ", toolName))
+	}
+	loc := c.Diagnostic.GetLocation()
+	sb.WriteString(loc.GetPath())
+	if startLine := int(loc.GetRange().GetStart().GetLine()); startLine > 0 {
+		sb.WriteString(fmt.Sprintf("#L%d", startLine))
+		if endLine := int(loc.GetRange().GetEnd().GetLine()); startLine < endLine {
+			sb.WriteString(fmt.Sprintf("-L%d", endLine))
+		}
+	}
+	if code := c.Diagnostic.GetCode().GetValue(); code != "" {
+		if url := c.Diagnostic.GetCode().GetUrl(); url != "" {
+			sb.WriteString(fmt.Sprintf(" <%s>(%s)", code, url))
+		} else {
+			sb.WriteString(fmt.Sprintf(" <%s>", code))
+		}
+	}
+	return sb.String()
 }
 
 func (ch *Checker) pullRequestDiff(ctx context.Context, pr int) ([]*diff.FileDiff, error) {
@@ -230,7 +292,7 @@ func (ch *Checker) pullRequestDiff(ctx context.Context, pr int) ([]*diff.FileDif
 	}
 	filediffs, err := diff.ParseMultiFile(bytes.NewReader(d))
 	if err != nil {
-		return nil, fmt.Errorf("fail to parse diff: %v", err)
+		return nil, fmt.Errorf("fail to parse diff: %w", err)
 	}
 	return filediffs, nil
 }
@@ -243,17 +305,31 @@ func (ch *Checker) rawPullRequestDiff(ctx context.Context, pr int) ([]byte, erro
 	return d, nil
 }
 
-func annotationsToCheckResults(as []*doghouse.Annotation) []*reviewdog.CheckResult {
-	cs := make([]*reviewdog.CheckResult, 0, len(as))
+func annotationsToDiagnostics(as []*doghouse.Annotation) []*rdf.Diagnostic {
+	ds := make([]*rdf.Diagnostic, 0, len(as))
 	for _, a := range as {
-		cs = append(cs, &reviewdog.CheckResult{
-			Path:    a.Path,
-			Lnum:    a.Line,
-			Message: a.Message,
-			Lines:   strings.Split(a.RawMessage, "\n"),
-		})
+		ds = append(ds, annotationToDiagnostic(a))
 	}
-	return cs
+	return ds
+}
+
+func annotationToDiagnostic(a *doghouse.Annotation) *rdf.Diagnostic {
+	if a.Diagnostic != nil {
+		return a.Diagnostic
+	}
+	// Old reviwedog CLI doesn't have the Diagnostic field.
+	return &rdf.Diagnostic{
+		Location: &rdf.Location{
+			Path: a.Path,
+			Range: &rdf.Range{
+				Start: &rdf.Position{
+					Line: int32(a.Line),
+				},
+			},
+		},
+		Message:        a.Message,
+		OriginalOutput: a.RawMessage,
+	}
 }
 
 func min(x, y int) int {

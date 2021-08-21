@@ -10,12 +10,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v28/github"
+	"github.com/google/go-github/v38/github"
 	"github.com/kylelemons/godebug/pretty"
 	"golang.org/x/oauth2"
 
 	"github.com/reviewdog/reviewdog"
-	"github.com/reviewdog/reviewdog/service/serviceutil"
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/proto/rdf"
+	"github.com/reviewdog/reviewdog/service/commentutil"
 )
 
 const notokenSkipTestMes = "skipping test (requires actual Personal access tokens. export REVIEWDOG_TEST_GITHUB_API_TOKEN=<GitHub Personal Access Token>)"
@@ -28,8 +30,24 @@ func setupGitHubClient() *github.Client {
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
 	)
-	tc := oauth2.NewClient(oauth2.NoContext, ts)
+	tc := oauth2.NewClient(context.TODO(), ts)
 	return github.NewClient(tc)
+}
+
+func setupEnvs() (cleanup func()) {
+	var cleanEnvs = []string{
+		"GITHUB_ACTIONS",
+	}
+	saveEnvs := make(map[string]string)
+	for _, key := range cleanEnvs {
+		saveEnvs[key] = os.Getenv(key)
+		os.Unsetenv(key)
+	}
+	return func() {
+		for key, value := range saveEnvs {
+			os.Setenv(key, value)
+		}
+	}
 }
 
 func moveToRootDir() {
@@ -54,11 +72,15 @@ func TestGitHubPullRequest_Post(t *testing.T) {
 		t.Fatal(err)
 	}
 	comment := &reviewdog.Comment{
-		CheckResult: &reviewdog.CheckResult{
-			Path: "watchdogs.go",
+		Result: &filter.FilteredDiagnostic{
+			Diagnostic: &rdf.Diagnostic{
+				Location: &rdf.Location{
+					Path: "watchdogs.go",
+				},
+				Message: "[reviewdog] test",
+			},
+			InDiffContext: true,
 		},
-		LnumDiff: 17,
-		Body:     "[reviewdog] test",
 	}
 	// https://github.com/reviewdog/reviewdog/pull/2/files#diff-ed1d019a10f54464cfaeaf6a736b7d27L20
 	if err := g.Post(context.Background(), comment); err != nil {
@@ -175,6 +197,7 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 	cwd, _ := os.Getwd()
 	defer os.Chdir(cwd)
 	moveToRootDir()
+	defer setupEnvs()()
 
 	listCommentsAPICalled := 0
 	postCommentsAPICalled := 0
@@ -188,9 +211,9 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 		default:
 			cs := []*github.PullRequestComment{
 				{
-					Path:     github.String("reviewdog.go"),
-					Position: github.Int(1),
-					Body:     github.String(serviceutil.BodyPrefix + "\nalready commented"),
+					Path: github.String("reviewdog.go"),
+					Line: github.Int(2),
+					Body: github.String(commentutil.BodyPrefix + "already commented"),
 				},
 			}
 			w.Header().Add("Link", `<https://api.github.com/repos/o/r/pulls/14/comments?page=2>; rel="next"`)
@@ -200,9 +223,21 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 		case "2":
 			cs := []*github.PullRequestComment{
 				{
-					Path:     github.String("reviewdog.go"),
-					Position: github.Int(14),
-					Body:     github.String(serviceutil.BodyPrefix + "\nalready commented 2"),
+					Path: github.String("reviewdog.go"),
+					Line: github.Int(15),
+					Body: github.String(commentutil.BodyPrefix + "already commented 2"),
+				},
+				{
+					Path:      github.String("reviewdog.go"),
+					StartLine: github.Int(15),
+					Line:      github.Int(16),
+					Body:      github.String(commentutil.BodyPrefix + "multiline existing comment"),
+				},
+				{
+					Path:      github.String("reviewdog.go"),
+					StartLine: github.Int(15),
+					Line:      github.Int(17),
+					Body:      github.String(commentutil.BodyPrefix + "multiline existing comment (line-break)"),
 				},
 			}
 			if err := json.NewEncoder(w).Encode(cs); err != nil {
@@ -230,9 +265,216 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 		}
 		want := []*github.DraftReviewComment{
 			{
-				Path:     github.String("reviewdog.go"),
-				Position: github.Int(14),
-				Body:     github.String(serviceutil.BodyPrefix + "\nnew comment"),
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + "new comment"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body:      github.String(commentutil.BodyPrefix + "multiline new comment"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"multiline suggestion comment",
+					"```suggestion",
+					"line1",
+					"line2",
+					"line3",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"singleline suggestion comment",
+					"```suggestion",
+					"line1",
+					"line2",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"invalid lines suggestion comment",
+					invalidSuggestionPre + "GitHub comment range and suggestion line range must be same. L15-L16 v.s. L16-L17" + invalidSuggestionPost,
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(14),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"Use suggestion range as GitHub comment range if the suggestion is in diff context",
+					"```suggestion",
+					"line1",
+					"line2",
+					"line3",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(14),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"Partially invalid suggestions",
+					"```suggestion",
+					"line1",
+					"line2",
+					"line3",
+					"```",
+					invalidSuggestionPre + "GitHub comment range and suggestion line range must be same. L14-L16 v.s. L14-L14" + invalidSuggestionPost,
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"non-line based suggestion comment (no source lines)",
+					invalidSuggestionPre + "source lines are not available" + invalidSuggestionPost,
+				}, "\n") + "\n"),
+			},
+			{
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"range suggestion (single line)",
+					"```suggestion",
+					"haya14busa",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"range suggestion (multi-line)",
+					"```suggestion",
+					"haya14busa (multi-line)",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(17),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"range suggestion (line-break, remove)",
+					"```suggestion",
+					"line 15 (content at line 15)",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"range suggestion (insert)",
+					"```suggestion",
+					"haya14busa",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"multiple suggestions",
+					"```suggestion",
+					"haya1busa",
+					"```",
+					"```suggestion",
+					"haya4busa",
+					"```",
+					"```suggestion",
+					"haya14busa",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"range suggestion with start only location",
+					"```suggestion",
+					"haya14busa",
+					"```",
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"multiline suggestion comment including a code fence block",
+					"````suggestion",
+					"```",
+					"some code",
+					"```",
+					"````",
+				}, "\n") + "\n"),
+			},
+			{
+				Path: github.String("reviewdog.go"),
+				Side: github.String("RIGHT"),
+				Line: github.Int(15),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"singleline suggestion comment including a code fence block",
+					"````suggestion",
+					"```",
+					"some code",
+					"```",
+					"````",
+				}, "\n") + "\n"),
+			},
+			{
+				Path:      github.String("reviewdog.go"),
+				Side:      github.String("RIGHT"),
+				StartSide: github.String("RIGHT"),
+				StartLine: github.Int(15),
+				Line:      github.Int(16),
+				Body: github.String(commentutil.BodyPrefix + strings.Join([]string{
+					"multiline suggestion comment including an empty code fence block",
+					"``````suggestion",
+					"```",
+					"`````",
+					"``````",
+				}, "\n") + "\n"),
 			},
 		}
 		if diff := pretty.Compare(want, req.Comments); diff != "" {
@@ -250,25 +492,590 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 	}
 	comments := []*reviewdog.Comment{
 		{
-			CheckResult: &reviewdog.CheckResult{
-				Path: "reviewdog.go",
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 2,
+							},
+						},
+					},
+					Message: "already commented",
+				},
+				InDiffContext: true,
 			},
-			LnumDiff: 1,
-			Body:     "already commented",
 		},
 		{
-			CheckResult: &reviewdog.CheckResult{
-				Path: "reviewdog.go",
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+						},
+					},
+					Message: "already commented 2",
+				},
+				InDiffContext: true,
 			},
-			LnumDiff: 14,
-			Body:     "already commented 2",
 		},
 		{
-			CheckResult: &reviewdog.CheckResult{
-				Path: "reviewdog.go",
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+						},
+					},
+					Message: "new comment",
+				},
+				InDiffContext: true,
 			},
-			LnumDiff: 14,
-			Body:     "new comment",
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Message: "multiline existing comment",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line:   15,
+								Column: 1,
+							},
+							End: &rdf.Position{
+								Line:   17,
+								Column: 1,
+							},
+						},
+					},
+					Message: "multiline existing comment (line-break)",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Message: "multiline new comment",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						// No Line
+					},
+					Message: "should not be reported via GitHub Review API",
+				},
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 15,
+								},
+								End: &rdf.Position{
+									Line: 16,
+								},
+							},
+							Text: "line1\nline2\nline3",
+						},
+					},
+					Message: "multiline suggestion comment",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 15,
+								},
+							},
+							Text: "line1\nline2",
+						},
+					},
+					Message: "singleline suggestion comment",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 16,
+								},
+								End: &rdf.Position{
+									Line: 17,
+								},
+							},
+							Text: "line1\nline2\nline3",
+						},
+					},
+					Message: "invalid lines suggestion comment",
+				},
+				InDiffContext:                true,
+				FirstSuggestionInDiffContext: false,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{
+					14: "line 14 before",
+					15: "line 15 before",
+					16: "line 16 before",
+				},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 14,
+								},
+								End: &rdf.Position{
+									Line: 16,
+								},
+							},
+							Text: "line1\nline2\nline3",
+						},
+					},
+					Message: "Use suggestion range as GitHub comment range if the suggestion is in diff context",
+				},
+				InDiffContext:                true,
+				FirstSuggestionInDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{
+					14: "line 14 before",
+					15: "line 15 before",
+					16: "line 16 before",
+				},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 14,
+								},
+								End: &rdf.Position{
+									Line: 16,
+								},
+							},
+							Text: "line1\nline2\nline3",
+						},
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 14,
+								},
+								End: &rdf.Position{
+									Line: 14,
+								},
+							},
+							Text: "line1\nline2",
+						},
+					},
+					Message: "Partially invalid suggestions",
+				},
+				InDiffContext:                true,
+				FirstSuggestionInDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line:   15,
+									Column: 5,
+								},
+								End: &rdf.Position{
+									Line:   16,
+									Column: 7,
+								},
+							},
+							Text: "replacement",
+						},
+					},
+					Message: "non-line based suggestion comment (no source lines)",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{15: "haya15busa"},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 15, Column: 5},
+							End:   &rdf.Position{Line: 15, Column: 7},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 15, Column: 7},
+							},
+							Text: "14",
+						},
+					},
+					Message: "range suggestion (single line)",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{
+					15: "haya???",
+					16: "???busa (multi-line)",
+				},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 15, Column: 5},
+							End:   &rdf.Position{Line: 16, Column: 4},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 16, Column: 4},
+							},
+							Text: "14",
+						},
+					},
+					Message: "range suggestion (multi-line)",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{
+					15: "line 15 xxx",
+					16: "line 16",
+					17: "(content at line 15)",
+				},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 15, Column: 9},
+							End:   &rdf.Position{Line: 17, Column: 1},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 9},
+								End:   &rdf.Position{Line: 17, Column: 1},
+							},
+							Text: "",
+						},
+					},
+					Message: "range suggestion (line-break, remove)",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{
+					15: "hayabusa",
+				},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 15, Column: 5},
+							End:   &rdf.Position{Line: 15, Column: 5},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 15, Column: 5},
+							},
+							Text: "14",
+						},
+					},
+					Message: "range suggestion (insert)",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{15: "haya??busa"},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 15, Column: 5},
+							End:   &rdf.Position{Line: 15, Column: 7},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 15, Column: 7},
+							},
+							Text: "1",
+						},
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 15, Column: 7},
+							},
+							Text: "4",
+						},
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 15, Column: 7},
+							},
+							Text: "14",
+						},
+					},
+					Message: "multiple suggestions",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				SourceLines: map[int]string{15: "haya15busa"},
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 15, Column: 5},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{Line: 15, Column: 5},
+								End:   &rdf.Position{Line: 15, Column: 7},
+							},
+							Text: "14",
+						},
+					},
+					Message: "range suggestion with start only location",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 15,
+								},
+								End: &rdf.Position{
+									Line: 16,
+								},
+							},
+							Text: "```\nsome code\n```",
+						},
+					},
+					Message: "multiline suggestion comment including a code fence block",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 15,
+								},
+							},
+							Text: "```\nsome code\n```",
+						},
+					},
+					Message: "singleline suggestion comment including a code fence block",
+				},
+				InDiffContext: true,
+			},
+		},
+		{
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{
+							Start: &rdf.Position{
+								Line: 15,
+							},
+							End: &rdf.Position{
+								Line: 16,
+							},
+						},
+					},
+					Suggestions: []*rdf.Suggestion{
+						{
+							Range: &rdf.Range{
+								Start: &rdf.Position{
+									Line: 15,
+								},
+								End: &rdf.Position{
+									Line: 16,
+								},
+							},
+							Text: "```\n`````",
+						},
+					},
+					Message: "multiline suggestion comment including an empty code fence block",
+				},
+				InDiffContext: true,
+			},
 		},
 	}
 	for _, c := range comments {
@@ -290,8 +1097,8 @@ func TestGitHubPullRequest_Post_Flush_review_api(t *testing.T) {
 func TestGitHubPullRequest_Post_toomany(t *testing.T) {
 	cwd, _ := os.Getwd()
 	defer os.Chdir(cwd)
-
 	moveToRootDir()
+	defer setupEnvs()()
 
 	listCommentsAPICalled := 0
 	postCommentsAPICalled := 0
@@ -325,12 +1132,18 @@ func TestGitHubPullRequest_Post_toomany(t *testing.T) {
 	var comments []*reviewdog.Comment
 	for i := 0; i < 100; i++ {
 		comments = append(comments, &reviewdog.Comment{
-			CheckResult: &reviewdog.CheckResult{
-				Path: "reviewdog.go",
-				Lnum: i,
+			Result: &filter.FilteredDiagnostic{
+				Diagnostic: &rdf.Diagnostic{
+					Location: &rdf.Location{
+						Path: "reviewdog.go",
+						Range: &rdf.Range{Start: &rdf.Position{
+							Line: int32(i),
+						}},
+					},
+					Message: "comment",
+				},
+				InDiffContext: true,
 			},
-			LnumDiff: i,
-			Body:     "comment",
 			ToolName: "tool",
 		})
 	}
@@ -354,6 +1167,7 @@ func TestGitHubPullRequest_workdir(t *testing.T) {
 	cwd, _ := os.Getwd()
 	defer os.Chdir(cwd)
 	moveToRootDir()
+	defer setupEnvs()()
 
 	g, err := NewGitHubPullRequest(nil, "", "", 0, "")
 	if err != nil {
@@ -364,8 +1178,9 @@ func TestGitHubPullRequest_workdir(t *testing.T) {
 	}
 	ctx := context.Background()
 	want := "a/b/c"
-	g.Post(ctx, &reviewdog.Comment{CheckResult: &reviewdog.CheckResult{Path: want}})
-	if got := g.postComments[0].Path; got != want {
+	g.Post(ctx, &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{Location: &rdf.Location{Path: want}}}})
+	if got := g.postComments[0].Result.Diagnostic.GetLocation().GetPath(); got != want {
 		t.Errorf("wd=%q path=%q, want %q", g.wd, got, want)
 	}
 
@@ -379,8 +1194,9 @@ func TestGitHubPullRequest_workdir(t *testing.T) {
 	}
 	path := "a/b/c"
 	wantPath := "cmd/" + path
-	g.Post(ctx, &reviewdog.Comment{CheckResult: &reviewdog.CheckResult{Path: path}})
-	if got := g.postComments[0].Path; got != wantPath {
+	g.Post(ctx, &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{Location: &rdf.Location{Path: want}}}})
+	if got := g.postComments[0].Result.Diagnostic.GetLocation().GetPath(); got != wantPath {
 		t.Errorf("wd=%q path=%q, want %q", g.wd, got, wantPath)
 	}
 }

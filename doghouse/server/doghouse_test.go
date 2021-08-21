@@ -7,9 +7,11 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-github/v28/github"
+	"github.com/google/go-github/v38/github"
 
 	"github.com/reviewdog/reviewdog/doghouse"
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 )
 
 type fakeCheckerGitHubCli struct {
@@ -31,16 +33,16 @@ func (f *fakeCheckerGitHubCli) UpdateCheckRun(ctx context.Context, owner, repo s
 	return f.FakeUpdateCheckRun(ctx, owner, repo, checkID, opt)
 }
 
-const sampleDiff = `--- sample.old.txt	2016-10-13 05:09:35.820791185 +0900
-+++ sample.new.txt	2016-10-13 05:15:26.839245048 +0900
+const sampleDiff = `--- a/sample.old.txt	2016-10-13 05:09:35.820791185 +0900
++++ b/sample.new.txt	2016-10-13 05:15:26.839245048 +0900
 @@ -1,3 +1,4 @@
  unchanged, contextual line
 -deleted line
 +added line
 +added line
  unchanged, contextual line
---- nonewline.old.txt	2016-10-13 15:34:14.931778318 +0900
-+++ nonewline.new.txt	2016-10-13 15:34:14.868444672 +0900
+--- a/nonewline.old.txt	2016-10-13 15:34:14.931778318 +0900
++++ b/nonewline.new.txt	2016-10-13 15:34:14.868444672 +0900
 @@ -1,4 +1,4 @@
  " vim: nofixeol noendofline
  No newline at end of both the old and new file
@@ -72,16 +74,116 @@ func TestCheck_OK(t *testing.T) {
 		SHA:         sha,
 		Annotations: []*doghouse.Annotation{
 			{
-				Path:       "sample.new.txt",
-				Line:       2,
-				Message:    "test message",
-				RawMessage: "raw test message",
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test message",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2, Column: 1},
+						},
+					},
+					OriginalOutput: "raw test message",
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test message outside diff",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 14},
+						},
+					},
+					OriginalOutput: "raw test message outside diff",
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test multiline",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2},
+							End:   &rdf.Position{Line: 3},
+						},
+					},
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test multiline with column",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2, Column: 1},
+							End:   &rdf.Position{Line: 3, Column: 5},
+						},
+					},
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test range comment",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2, Column: 1},
+							End:   &rdf.Position{Line: 2, Column: 5},
+						},
+					},
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message:  "test severity override",
+					Severity: rdf.Severity_ERROR,
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2},
+						},
+					},
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "source test",
+					Source: &rdf.Source{
+						Name: "awesome-linter",
+					},
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2},
+						},
+					},
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "code test w/o URL",
+					Location: &rdf.Location{
+						Path:  "sample.new.txt",
+						Range: &rdf.Range{Start: &rdf.Position{Line: 2}},
+					},
+					Code: &rdf.Code{Value: "CODE14"},
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "code test w/ URL",
+					Location: &rdf.Location{
+						Path:  "sample.new.txt",
+						Range: &rdf.Range{Start: &rdf.Position{Line: 2}},
+					},
+					Code: &rdf.Code{Value: "CODE14", Url: "https://github.com/reviewdog#CODE14"},
+				},
 			},
 			{
 				Path:       "sample.new.txt",
-				Line:       14,
-				Message:    "test message outside diff",
-				RawMessage: "raw test message outside diff",
+				Line:       2,
+				Message:    "request from old clients",
+				RawMessage: "raw message from old clients",
 			},
 		},
 		Level: "warning",
@@ -123,6 +225,73 @@ func TestCheck_OK(t *testing.T) {
 					Title:           github.String("[haya14busa-linter] sample.new.txt#L2"),
 					RawDetails:      github.String("raw test message"),
 				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(3),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("test multiline"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2-L3"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(3),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("test multiline with column"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2-L3"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					StartColumn:     github.Int(1),
+					EndColumn:       github.Int(5),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("test range comment"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					AnnotationLevel: github.String("failure"),
+					Message:         github.String("test severity override"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("source test"),
+					Title:           github.String("[awesome-linter] sample.new.txt#L2"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("code test w/o URL"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2 <CODE14>"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("code test w/ URL"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2 <CODE14>(https://github.com/reviewdog#CODE14)"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("request from old clients"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2"),
+					RawDetails:      github.String("raw message from old clients"),
+				},
 			}
 			if d := cmp.Diff(annotations, wantAnnotations); d != "" {
 				t.Errorf("Annotation diff found:\n%s", d)
@@ -139,6 +308,110 @@ func TestCheck_OK(t *testing.T) {
 	if res.ReportURL != reportURL {
 		t.Errorf("res.reportURL = %q, want %q", res.ReportURL, reportURL)
 	}
+}
+
+func testOutsideDiff(t *testing.T, outsideDiff bool, filterMode filter.Mode) {
+	const (
+		name        = "haya14busa-linter"
+		owner       = "haya14busa"
+		repo        = "reviewdog"
+		prNum       = 14
+		sha         = "1414"
+		reportURL   = "http://example.com/report_url"
+		conclusion  = "neutral"
+		wantCheckID = 1414
+	)
+
+	req := &doghouse.CheckRequest{
+		Name:        name,
+		Owner:       owner,
+		Repo:        repo,
+		PullRequest: prNum,
+		SHA:         sha,
+		Annotations: []*doghouse.Annotation{
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test message",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2},
+						},
+					},
+					OriginalOutput: "raw test message",
+				},
+			},
+			{
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test message outside diff",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 14},
+						},
+					},
+					OriginalOutput: "raw test message outside diff",
+				},
+			},
+		},
+		Level:       "warning",
+		OutsideDiff: outsideDiff,
+		FilterMode:  filterMode,
+	}
+
+	cli := &fakeCheckerGitHubCli{}
+	cli.FakeGetPullRequestDiff = func(ctx context.Context, owner, repo string, number int) ([]byte, error) {
+		return []byte(sampleDiff), nil
+	}
+	cli.FakeCreateCheckRun = func(ctx context.Context, owner, repo string, opt github.CreateCheckRunOptions) (*github.CheckRun, error) {
+		return &github.CheckRun{ID: github.Int64(wantCheckID)}, nil
+	}
+	cli.FakeUpdateCheckRun = func(ctx context.Context, owner, repo string, checkID int64, opt github.UpdateCheckRunOptions) (*github.CheckRun, error) {
+		annotations := opt.Output.Annotations
+		if len(annotations) == 0 {
+			if *opt.Conclusion != conclusion {
+				t.Errorf("UpdateCheckRunOptions.Conclusion = %q, want %q", *opt.Conclusion, conclusion)
+			}
+		} else {
+			wantAnnotations := []*github.CheckRunAnnotation{
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(2),
+					EndLine:         github.Int(2),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("test message"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L2"),
+					RawDetails:      github.String("raw test message"),
+				},
+				{
+					Path:            github.String("sample.new.txt"),
+					StartLine:       github.Int(14),
+					EndLine:         github.Int(14),
+					AnnotationLevel: github.String("warning"),
+					Message:         github.String("test message outside diff"),
+					Title:           github.String("[haya14busa-linter] sample.new.txt#L14"),
+					RawDetails:      github.String("raw test message outside diff"),
+				},
+			}
+			if d := cmp.Diff(annotations, wantAnnotations); d != "" {
+				t.Errorf("Annotation diff found:\n%s", d)
+			}
+		}
+		return &github.CheckRun{HTMLURL: github.String(reportURL)}, nil
+	}
+	checker := &Checker{req: req, gh: cli}
+	if _, err := checker.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheck_OK_deprecated_outsidediff(t *testing.T) {
+	t.Run("deprecated: outside_diff", func(t *testing.T) {
+		testOutsideDiff(t, true, filter.ModeDefault)
+	})
+	t.Run("filter-mode=NoFilter", func(t *testing.T) {
+		testOutsideDiff(t, false, filter.ModeNoFilter)
+	})
 }
 
 func TestCheck_OK_multiple_update_runs(t *testing.T) {
@@ -163,10 +436,16 @@ func TestCheck_OK_multiple_update_runs(t *testing.T) {
 	}
 	for i := 0; i < 101; i++ {
 		req.Annotations = append(req.Annotations, &doghouse.Annotation{
-			Path:       "sample.new.txt",
-			Line:       2,
-			Message:    "test message",
-			RawMessage: "raw test message",
+			Diagnostic: &rdf.Diagnostic{
+				Message: "test message",
+				Location: &rdf.Location{
+					Path: "sample.new.txt",
+					Range: &rdf.Range{
+						Start: &rdf.Position{Line: 2},
+					},
+				},
+				OriginalOutput: "raw test message",
+			},
 		})
 	}
 
@@ -224,16 +503,28 @@ func TestCheck_OK_nonPullRequests(t *testing.T) {
 		SHA:   sha,
 		Annotations: []*doghouse.Annotation{
 			{
-				Path:       "sample.new.txt",
-				Line:       2,
-				Message:    "test message",
-				RawMessage: "raw test message",
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test message",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 2},
+						},
+					},
+					OriginalOutput: "raw test message",
+				},
 			},
 			{
-				Path:       "sample.new.txt",
-				Line:       14,
-				Message:    "test message2",
-				RawMessage: "raw test message2",
+				Diagnostic: &rdf.Diagnostic{
+					Message: "test message2",
+					Location: &rdf.Location{
+						Path: "sample.new.txt",
+						Range: &rdf.Range{
+							Start: &rdf.Position{Line: 14},
+						},
+					},
+					OriginalOutput: "raw test message2",
+				},
 			},
 		},
 		Level: "warning",
